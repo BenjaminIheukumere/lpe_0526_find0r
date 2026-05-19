@@ -69,6 +69,8 @@ class HostResult:
     reachable: bool
     uname: str = ""
     packagekit_version: str = "not_found"
+    os_release: str = "unknown"
+    kernel_package: str = "not_found"
     findings: List[Finding] = field(default_factory=list)
 
 
@@ -101,6 +103,10 @@ def parse_version_tuple(v: str) -> Tuple[int, ...]:
 
 def version_in_range(v: str, low: str, high: str) -> bool:
     return parse_version_tuple(low) <= parse_version_tuple(v) <= parse_version_tuple(high)
+
+
+def version_at_least(v: str, minimum: str) -> bool:
+    return parse_version_tuple(v) >= parse_version_tuple(minimum)
 
 
 def positive_float(value: str) -> float:
@@ -158,6 +164,13 @@ def parse_target_spec(value: str) -> TargetSpec:
     return TargetSpec(label=str(network), hosts=expand_network(network))
 
 
+def os_release_parts(value: str) -> Tuple[str, str, str]:
+    parts = (value or "unknown:unknown:").split(":", 2)
+    while len(parts) < 3:
+        parts.append("")
+    return parts[0].strip().lower(), parts[1].strip().strip('"'), parts[2].strip().lower()
+
+
 def print_banner() -> None:
     art = r'''
  /$$       /$$$$$$$  /$$$$$$$$        /$$$$$$  /$$$$$$$   /$$$$$$   /$$$$$$       
@@ -179,7 +192,7 @@ def print_banner() -> None:
       | $$      | $$| $$  | $$|  $$$$$$$|  $$$$$$/| $$                            
       |__/      |__/|__/  |__/ \_______/ \______/ |__/                            
                                                                                   
-  Authenticated scans for DirtyFrag | CopyFail | Pack2TheRoot Linux LPE vulns
+  Authenticated scans for DirtyFrag | Fragnesia | DirtyDecrypt | SSH Keysign Pwn | CopyFail | Pack2TheRoot Linux LPE vulns
   by Benjamin Iheukumere | SafeLink IT 
                                                                                   
 '''
@@ -219,7 +232,7 @@ def tcp_open(host: str, port: int, timeout: float) -> bool:
         return False
 
 
-# Collect only the remote facts needed for the three local privilege escalation checks.
+# Collect only the remote facts needed for the local privilege escalation checks.
 def ssh_collect(host: str, user: str, password: str, config: ScanConfig) -> Dict[str, str]:
     client = paramiko.SSHClient()
     if config.strict_host_key:
@@ -241,7 +254,19 @@ def ssh_collect(host: str, user: str, password: str, config: ScanConfig) -> Dict
 
     cmds = {
         "uname": "uname -r",
+        "os_release": ". /etc/os-release 2>/dev/null; echo ${ID:-unknown}:${VERSION_ID:-unknown}:${ID_LIKE:-}",
+        "os_codename": ". /etc/os-release 2>/dev/null; echo ${VERSION_CODENAME:-unknown}",
         "mod_rxrpc": "test -d /sys/module/rxrpc && echo 1 || echo 0",
+        "rxrpc_available": "modinfo rxrpc >/dev/null 2>&1 && echo 1 || echo 0",
+        "config_rxgk": "(zgrep -h '^CONFIG_RXGK=' /proc/config.gz /boot/config-$(uname -r) /lib/modules/$(uname -r)/build/.config /lib/modules/$(uname -r)/source/.config 2>/dev/null || echo unknown) | tail -n1",
+        "mod_esp4": "test -d /sys/module/esp4 && echo 1 || echo 0",
+        "mod_esp6": "test -d /sys/module/esp6 && echo 1 || echo 0",
+        "module_mitigation": "grep -RhsE '^(install|blacklist)[[:space:]]+(esp4|esp6|rxrpc)([[:space:]]|$)' /etc/modprobe.d /run/modprobe.d /usr/lib/modprobe.d 2>/dev/null | tr '\\n' ';' | head -c 500 || true",
+        "rxgk_ioc": "dmesg 2>/dev/null | grep -Ei 'rxgk_decrypt_skb|rxgk_verify_response|__skb_to_sgvec|DirtyDecrypt|DirtyCBC' | tail -n3 | tr '\\n' ';' | head -c 500 || true",
+        "ptrace_scope": "cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo unknown",
+        "ssh_keysign": "for p in /usr/lib/openssh/ssh-keysign /usr/libexec/openssh/ssh-keysign /usr/lib/ssh/ssh-keysign; do if [ -e \"$p\" ]; then stat -c '%n:%U:%G:%a:%A' \"$p\"; fi; done | tr '\\n' ';' | head -c 500 || echo not_found",
+        "chage": "if command -v chage >/dev/null 2>&1; then p=$(command -v chage); stat -c '%n:%U:%G:%a:%A' \"$p\"; else echo not_found; fi",
+        "kernel_package": "kr=$(uname -r); (dpkg-query -W -f='${Version}' linux-image-$kr 2>/dev/null || rpm -q kernel-core-$kr 2>/dev/null || rpm -q kernel-$kr 2>/dev/null || echo not_found) | head -n1",
         "packagekit": "(dpkg-query -W -f='${Version}' packagekit 2>/dev/null || rpm -q --qf '%{VERSION}-%{RELEASE}' PackageKit 2>/dev/null || rpm -q --qf '%{VERSION}-%{RELEASE}' packagekit 2>/dev/null || echo not_found) | head -n1",
     }
 
@@ -256,17 +281,221 @@ def ssh_collect(host: str, user: str, password: str, config: ScanConfig) -> Dict
     return out
 
 
+def module_blocked(module: str, mitigation_text: str) -> bool:
+    text = mitigation_text or ""
+    blacklist_pattern = rf"(^|;)\s*blacklist\s+{re.escape(module)}(\s|;|$)"
+    install_pattern = rf"(^|;)\s*install\s+{re.escape(module)}\s+(/usr)?/bin/(false|true)(\s|;|$)"
+    return (
+        re.search(blacklist_pattern, text, re.IGNORECASE) is not None
+        or re.search(install_pattern, text, re.IGNORECASE) is not None
+    )
+
+
+def mitigation_summary(mitigation_text: str) -> str:
+    blocked = [module for module in ("esp4", "esp6", "rxrpc") if module_blocked(module, mitigation_text)]
+    if len(blocked) == 3:
+        return "esp4/esp6/rxrpc blocked"
+    if blocked:
+        return f"partial block: {','.join(blocked)}"
+    return "none detected"
+
+
+def almalinux_fragnesia_patched(kernel: str, os_release: str) -> bool:
+    distro_id, version_id, id_like = os_release_parts(os_release)
+    if distro_id != "almalinux" and "almalinux" not in id_like:
+        return False
+
+    baselines = {
+        "8": "4.18.0-553.124.3",
+        "9": "5.14.0-611.54.5",
+        "10": "6.12.0-124.56.3",
+    }
+    major = version_id.split(".", 1)[0]
+    minimum = baselines.get(major)
+    return bool(minimum and version_at_least(kernel, minimum))
+
+
+def ptrace_scope_mitigated(value: str) -> bool:
+    try:
+        return int((value or "").strip()) >= 2
+    except ValueError:
+        return False
+
+
+def helper_surface_detected(value: str) -> bool:
+    normalized = (value or "").strip().lower()
+    return bool(normalized and normalized != "not_found")
+
+
+def kernel_config_enabled(value: str) -> bool:
+    normalized = (value or "").strip().lower()
+    return normalized in {"config_rxgk=y", "config_rxgk=m"}
+
+
+def dirtydecrypt_distro_not_affected_or_patched(kernel_package: str, os_release: str, os_codename: str) -> bool:
+    distro_id, version_id, id_like = os_release_parts(os_release)
+    if distro_id != "debian" and "debian" not in id_like:
+        return False
+
+    codename = (os_codename or "").strip().lower()
+    major = version_id.split(".", 1)[0]
+
+    # Debian stable trackers mark bullseye/bookworm/trixie as not affected for CVE-2026-31635.
+    if codename in {"bullseye", "bookworm", "trixie"} or major in {"11", "12", "13"}:
+        return True
+
+    fixed_baselines = {
+        "forky": "7.0.7-1",
+        "sid": "7.0.7-1",
+    }
+    minimum = fixed_baselines.get(codename)
+    return bool(minimum and version_at_least(kernel_package, minimum))
+
+
+def dirtydecrypt_kernel_affected(kernel: str) -> bool:
+    parts = parse_version_tuple(kernel)
+    if len(parts) < 2:
+        return False
+
+    major, minor = parts[0], parts[1]
+    patch = parts[2] if len(parts) > 2 else 0
+    rc_match = re.search(r"7\.0(?:\.0)?-rc(\d+)", kernel)
+    if rc_match:
+        return 1 <= int(rc_match.group(1)) <= 7
+
+    if major != 6:
+        return False
+    if minor == 16:
+        return True
+    if minor == 17:
+        return True
+    if minor == 18:
+        return patch < 23
+    if minor == 19:
+        return patch < 13
+    return False
+
+
+def debian_ssh_keysign_pwn_patched(kernel_package: str, os_release: str, os_codename: str) -> bool:
+    distro_id, version_id, id_like = os_release_parts(os_release)
+    if distro_id != "debian" and "debian" not in id_like:
+        return False
+
+    codename = (os_codename or "").strip().lower()
+    major = version_id.split(".", 1)[0]
+    baselines = {
+        "11": "5.10.251-5",
+        "bullseye": "5.10.251-5",
+        "12": "6.1.172-1",
+        "bookworm": "6.1.172-1",
+        "13": "6.12.88-1",
+        "trixie": "6.12.88-1",
+        "forky": "7.0.7-1",
+        "sid": "7.0.7-1",
+    }
+    minimum = baselines.get(codename) or baselines.get(major)
+    return bool(minimum and version_at_least(kernel_package, minimum))
+
+
+def almalinux_ssh_keysign_pwn_patched(kernel: str, os_release: str) -> bool:
+    distro_id, version_id, id_like = os_release_parts(os_release)
+    if distro_id != "almalinux" and "almalinux" not in id_like:
+        return False
+
+    baselines = {
+        "8": "4.18.0-553.124.4",
+        "9": "5.14.0-611.54.6",
+        "10": "6.12.0-124.56.5",
+    }
+    major = version_id.split(".", 1)[0]
+    minimum = baselines.get(major)
+    return bool(minimum and version_at_least(kernel, minimum))
+
+
+def ssh_keysign_pwn_patched(kernel: str, kernel_package: str, os_release: str, os_codename: str) -> bool:
+    return (
+        debian_ssh_keysign_pwn_patched(kernel_package, os_release, os_codename)
+        or almalinux_ssh_keysign_pwn_patched(kernel, os_release)
+    )
+
+
 # Convert raw host facts into vulnerability findings.
 def assess(collected: Dict[str, str]) -> List[Finding]:
     kernel = collected.get("uname", "")
     pkg = collected.get("packagekit", "not_found")
+    os_release = collected.get("os_release", "unknown:unknown:")
+    os_codename = collected.get("os_codename", "unknown")
+    kernel_pkg = collected.get("kernel_package", "not_found")
     rxrpc = collected.get("mod_rxrpc") == "1"
+    rxrpc_available = collected.get("rxrpc_available") == "1"
+    config_rxgk = collected.get("config_rxgk", "unknown")
+    esp4 = collected.get("mod_esp4") == "1"
+    esp6 = collected.get("mod_esp6") == "1"
+    mitigation = collected.get("module_mitigation", "")
+    rxgk_ioc = collected.get("rxgk_ioc", "")
+    ptrace_scope = collected.get("ptrace_scope", "unknown")
+    ssh_keysign = collected.get("ssh_keysign", "not_found")
+    chage = collected.get("chage", "not_found")
+    fragnesia_mitigation = mitigation_summary(mitigation)
     findings: List[Finding] = []
 
     if version_in_range(kernel, "4.10", "7.0.99") or (version_in_range(kernel, "6.4", "7.0.99") and rxrpc):
         findings.append(Finding("Dirty Frag (CVE-2026-43284/43500)", TODO_STATUS, "medium", f"Kernel {kernel}, rxrpc_loaded={rxrpc}."))
     else:
         findings.append(Finding("Dirty Frag (CVE-2026-43284/43500)", "NO_DIRECT_INDICATOR", "low", f"Kernel {kernel} outside coarse window."))
+
+    fragnesia_reason = (
+        f"Kernel {kernel}, kernel_pkg={kernel_pkg}, esp4_loaded={esp4}, "
+        f"esp6_loaded={esp6}, rxrpc_loaded={rxrpc}, mitigation={fragnesia_mitigation}."
+    )
+    all_fragnesia_modules_blocked = all(module_blocked(module, mitigation) for module in ("esp4", "esp6", "rxrpc"))
+    if almalinux_fragnesia_patched(kernel, os_release):
+        findings.append(Finding("Fragnesia (CVE-2026-46300)", "POSSIBLY_PATCHED", "medium", f"{fragnesia_reason} AlmaLinux kernel baseline indicates published Fragnesia fix."))
+    elif version_in_range(kernel, "4.10", "7.0.99") and not all_fragnesia_modules_blocked:
+        confidence = "high" if esp4 or esp6 or rxrpc else "medium"
+        findings.append(Finding("Fragnesia (CVE-2026-46300)", TODO_STATUS, confidence, f"{fragnesia_reason} Kernel is in the coarse affected window and complete esp4/esp6/rxrpc mitigation was not detected."))
+    elif version_in_range(kernel, "4.10", "7.0.99"):
+        findings.append(Finding("Fragnesia (CVE-2026-46300)", "POSSIBLY_PATCHED", "medium", f"{fragnesia_reason} Complete modprobe mitigation appears present; verify loaded modules are removed/rebooted."))
+    else:
+        findings.append(Finding("Fragnesia (CVE-2026-46300)", "NO_DIRECT_INDICATOR", "low", f"{fragnesia_reason} Kernel outside coarse window."))
+
+    rxgk_enabled = kernel_config_enabled(config_rxgk)
+    rxrpc_blocked = module_blocked("rxrpc", mitigation)
+    dirtydecrypt_reason = (
+        f"Kernel {kernel}, kernel_pkg={kernel_pkg}, os={os_release}, codename={os_codename}, "
+        f"CONFIG_RXGK={config_rxgk}, rxrpc_loaded={rxrpc}, rxrpc_available={rxrpc_available}, "
+        f"rxrpc_blocked={rxrpc_blocked}, ioc={rxgk_ioc or 'none'}."
+    )
+    dirtydecrypt_affected_kernel = dirtydecrypt_kernel_affected(kernel)
+    if dirtydecrypt_distro_not_affected_or_patched(kernel_pkg, os_release, os_codename):
+        findings.append(Finding("DirtyDecrypt / DirtyCBC (CVE-2026-31635)", "POSSIBLY_PATCHED", "medium", f"{dirtydecrypt_reason} Distro tracker indicates this kernel line is not affected or fixed."))
+    elif rxgk_ioc:
+        findings.append(Finding("DirtyDecrypt / DirtyCBC (CVE-2026-31635)", TODO_STATUS, "high", f"{dirtydecrypt_reason} Kernel log contains RxGK/DirtyDecrypt indicators; investigate immediately."))
+    elif dirtydecrypt_affected_kernel and rxgk_enabled and not rxrpc_blocked:
+        confidence = "high" if rxrpc or rxrpc_available else "medium"
+        findings.append(Finding("DirtyDecrypt / DirtyCBC (CVE-2026-31635)", TODO_STATUS, confidence, f"{dirtydecrypt_reason} Kernel is in the coarse affected window, RxGK is enabled, and rxrpc module mitigation was not detected."))
+    elif dirtydecrypt_affected_kernel and config_rxgk == "unknown" and not rxrpc_blocked:
+        findings.append(Finding("DirtyDecrypt / DirtyCBC (CVE-2026-31635)", TODO_STATUS, "medium", f"{dirtydecrypt_reason} Kernel is in the affected CVE-2026-31635 range but CONFIG_RXGK could not be read; verify kernel config or patch status."))
+    elif dirtydecrypt_affected_kernel:
+        findings.append(Finding("DirtyDecrypt / DirtyCBC (CVE-2026-31635)", "POSSIBLY_PATCHED", "medium", f"{dirtydecrypt_reason} rxrpc mitigation appears present or RxGK is disabled; verify kernel patch level."))
+    else:
+        findings.append(Finding("DirtyDecrypt / DirtyCBC (CVE-2026-31635)", "NO_DIRECT_INDICATOR", "low", f"{dirtydecrypt_reason} Kernel outside known affected CVE-2026-31635 ranges."))
+
+    helper_surface = helper_surface_detected(ssh_keysign) or helper_surface_detected(chage)
+    ptrace_mitigated = ptrace_scope_mitigated(ptrace_scope)
+    ssh_keysign_reason = (
+        f"Kernel {kernel}, kernel_pkg={kernel_pkg}, os={os_release}, codename={os_codename}, "
+        f"ptrace_scope={ptrace_scope}, ssh_keysign={ssh_keysign or 'not_found'}, chage={chage or 'not_found'}."
+    )
+    if ssh_keysign_pwn_patched(kernel, kernel_pkg, os_release, os_codename):
+        findings.append(Finding("SSH Keysign Pwn (CVE-2026-46333)", "POSSIBLY_PATCHED", "medium", f"{ssh_keysign_reason} Kernel package baseline indicates published CVE-2026-46333 fix."))
+    elif version_in_range(kernel, "4.18", "7.0.99") and not ptrace_mitigated:
+        confidence = "high" if helper_surface else "medium"
+        findings.append(Finding("SSH Keysign Pwn (CVE-2026-46333)", TODO_STATUS, confidence, f"{ssh_keysign_reason} Kernel is in the coarse affected window and ptrace_scope mitigation 2/3 is not active."))
+    elif version_in_range(kernel, "4.18", "7.0.99"):
+        findings.append(Finding("SSH Keysign Pwn (CVE-2026-46333)", "POSSIBLY_PATCHED", "medium", f"{ssh_keysign_reason} ptrace_scope mitigation appears active; apply kernel fix to remove exposure."))
+    else:
+        findings.append(Finding("SSH Keysign Pwn (CVE-2026-46333)", "NO_DIRECT_INDICATOR", "low", f"{ssh_keysign_reason} Kernel outside coarse affected window."))
 
     if version_in_range(kernel, "4.10", "7.0.99"):
         findings.append(Finding("Copy Fail (CVE-2026-31431)", TODO_STATUS, "medium", f"Kernel {kernel} likely affected unless backported fix present."))
@@ -311,7 +540,10 @@ def report_path_for_target(output_dir: Path, prefix: str, target: str) -> Path:
 
 # Build the persisted report block for one actionable host.
 def host_report_block(result: HostResult) -> str:
-    lines = [f"Host: {result.host} | reachable={result.reachable} | kernel={result.uname or '-'} | packagekit={result.packagekit_version}"]
+    lines = [
+        f"Host: {result.host} | reachable={result.reachable} | kernel={result.uname or '-'} | "
+        f"kernel_package={result.kernel_package} | os={result.os_release} | packagekit={result.packagekit_version}"
+    ]
     for finding in result.findings:
         lines.append(f"  - {finding.vuln}: {finding.status} ({finding.confidence}) -> {finding.reason}")
     lines.append("")
@@ -343,6 +575,8 @@ def scan_host(host: str, user: str, password: str, config: ScanConfig) -> HostRe
     try:
         data = ssh_collect(host, user, password, config)
         result.uname = data.get("uname", "")
+        result.os_release = data.get("os_release", "unknown")
+        result.kernel_package = data.get("kernel_package", "not_found")
         result.packagekit_version = data.get("packagekit", "not_found")
         result.findings = assess(data)
     except Exception as exc:
@@ -651,7 +885,7 @@ def resolve_password(args: argparse.Namespace) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Authenticated Linux LPE exposure scanner for Dirty Frag, Copy Fail, and Pack2TheRoot.",
+        description="Authenticated Linux LPE exposure scanner for Dirty Frag, Fragnesia, DirtyDecrypt, SSH Keysign Pwn, Copy Fail, and Pack2TheRoot.",
     )
     parser.add_argument("subnet", nargs="?", help="CIDR or inclusive IP range to scan, e.g. 10.0.10.0/24 or 10.215.0.0-10.215.5.254")
     parser.add_argument("--subnet", dest="subnet_option", help="CIDR or inclusive IP range to scan; alternative to the positional target")
