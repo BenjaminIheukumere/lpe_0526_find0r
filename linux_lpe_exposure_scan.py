@@ -29,6 +29,7 @@ DEFAULT_REPORT_PREFIX = "lpe_scan_report"
 REPORT_EXTENSION = ".txt"
 TODO_STATUS = "LIKELY_VULNERABLE"
 DEFAULT_PASSWORD_ENV = "LPE_SCAN_PASSWORD"
+DEFAULT_KEY_PASSPHRASE_ENV = "LPE_SCAN_KEY_PASSPHRASE"
 MAX_LIVE_HOST_ROWS = 12
 Network = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
 
@@ -94,6 +95,8 @@ class ScanConfig:
     command_timeout: float
     strict_host_key: bool
     live: bool
+    key_file: Optional[Path] = None
+    key_passphrase: Optional[str] = None
 
 
 def parse_version_tuple(v: str) -> Tuple[int, ...]:
@@ -192,7 +195,7 @@ def print_banner() -> None:
       | $$      | $$| $$  | $$|  $$$$$$$|  $$$$$$/| $$                            
       |__/      |__/|__/  |__/ \_______/ \______/ |__/                            
                                                                                   
-  Authenticated scans for DirtyFrag | Fragnesia | DirtyDecrypt | SSH Keysign Pwn | CopyFail | Pack2TheRoot Linux LPE vulns
+  Authenticated scans for DirtyFrag | Fragnesia | DirtyDecrypt | PinTheft | SSH Keysign Pwn | CopyFail | Pack2TheRoot Linux LPE vulns
   by Benjamin Iheukumere | SafeLink IT 
                                                                                   
 '''
@@ -232,8 +235,23 @@ def tcp_open(host: str, port: int, timeout: float) -> bool:
         return False
 
 
+def kernel_config_cmd(option: str) -> str:
+    # Search the common kernel config locations without letting missing files hide real matches.
+    return (
+        "kr=$(uname -r); found=''; "
+        "for f in /proc/config.gz /boot/config-$kr /lib/modules/$kr/build/.config /lib/modules/$kr/source/.config; do "
+        "if [ -r \"$f\" ]; then "
+        f"case \"$f\" in *.gz) line=$(zgrep -h '^{option}=' \"$f\" 2>/dev/null | tail -n1);; "
+        f"*) line=$(grep -h '^{option}=' \"$f\" 2>/dev/null | tail -n1);; esac; "
+        "if [ -n \"$line\" ]; then found=\"$line\"; fi; "
+        "fi; "
+        "done; "
+        "printf '%s\\n' \"${found:-unknown}\""
+    )
+
+
 # Collect only the remote facts needed for the local privilege escalation checks.
-def ssh_collect(host: str, user: str, password: str, config: ScanConfig) -> Dict[str, str]:
+def ssh_collect(host: str, user: str, password: Optional[str], config: ScanConfig) -> Dict[str, str]:
     client = paramiko.SSHClient()
     if config.strict_host_key:
         client.load_system_host_keys()
@@ -241,16 +259,23 @@ def ssh_collect(host: str, user: str, password: str, config: ScanConfig) -> Dict
     else:
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-    client.connect(
-        host,
-        username=user,
-        password=password,
-        timeout=config.ssh_timeout,
-        auth_timeout=config.ssh_timeout,
-        banner_timeout=config.ssh_timeout,
-        look_for_keys=False,
-        allow_agent=False,
-    )
+    connect_kwargs = {
+        "hostname": host,
+        "username": user,
+        "timeout": config.ssh_timeout,
+        "auth_timeout": config.ssh_timeout,
+        "banner_timeout": config.ssh_timeout,
+        "look_for_keys": False,
+        "allow_agent": False,
+    }
+    if config.key_file:
+        connect_kwargs["key_filename"] = str(config.key_file)
+        if config.key_passphrase:
+            connect_kwargs["passphrase"] = config.key_passphrase
+    else:
+        connect_kwargs["password"] = password
+
+    client.connect(**connect_kwargs)
 
     cmds = {
         "uname": "uname -r",
@@ -258,11 +283,20 @@ def ssh_collect(host: str, user: str, password: str, config: ScanConfig) -> Dict
         "os_codename": ". /etc/os-release 2>/dev/null; echo ${VERSION_CODENAME:-unknown}",
         "mod_rxrpc": "test -d /sys/module/rxrpc && echo 1 || echo 0",
         "rxrpc_available": "modinfo rxrpc >/dev/null 2>&1 && echo 1 || echo 0",
-        "config_rxgk": "(zgrep -h '^CONFIG_RXGK=' /proc/config.gz /boot/config-$(uname -r) /lib/modules/$(uname -r)/build/.config /lib/modules/$(uname -r)/source/.config 2>/dev/null || echo unknown) | tail -n1",
+        "config_rxgk": kernel_config_cmd("CONFIG_RXGK"),
+        "mod_rds": "test -d /sys/module/rds && echo 1 || echo 0",
+        "mod_rds_tcp": "test -d /sys/module/rds_tcp && echo 1 || echo 0",
+        "rds_available": "modinfo rds >/dev/null 2>&1 && echo 1 || echo 0",
+        "rds_tcp_available": "modinfo rds_tcp >/dev/null 2>&1 && echo 1 || echo 0",
+        "config_rds": kernel_config_cmd("CONFIG_RDS"),
+        "config_rds_tcp": kernel_config_cmd("CONFIG_RDS_TCP"),
+        "config_io_uring": kernel_config_cmd("CONFIG_IO_URING"),
         "mod_esp4": "test -d /sys/module/esp4 && echo 1 || echo 0",
         "mod_esp6": "test -d /sys/module/esp6 && echo 1 || echo 0",
-        "module_mitigation": "grep -RhsE '^(install|blacklist)[[:space:]]+(esp4|esp6|rxrpc)([[:space:]]|$)' /etc/modprobe.d /run/modprobe.d /usr/lib/modprobe.d 2>/dev/null | tr '\\n' ';' | head -c 500 || true",
+        "module_mitigation": "grep -RhsE '^(install|blacklist)[[:space:]]+(esp4|esp6|rxrpc|rds|rds_tcp)([[:space:]]|$)' /etc/modprobe.d /run/modprobe.d /usr/lib/modprobe.d 2>/dev/null | tr '\\n' ';' | head -c 500 || true",
         "rxgk_ioc": "dmesg 2>/dev/null | grep -Ei 'rxgk_decrypt_skb|rxgk_verify_response|__skb_to_sgvec|DirtyDecrypt|DirtyCBC' | tail -n3 | tr '\\n' ';' | head -c 500 || true",
+        "io_uring_disabled": "cat /proc/sys/kernel/io_uring_disabled 2>/dev/null || echo unknown",
+        "readable_suid_targets": "for p in /usr/bin/su /bin/su /usr/bin/passwd /bin/passwd /usr/bin/sudo /usr/bin/mount /usr/bin/umount /usr/bin/chsh /usr/bin/chfn /usr/bin/newgrp /usr/bin/gpasswd /usr/lib/openssh/ssh-keysign /usr/libexec/openssh/ssh-keysign /usr/lib/ssh/ssh-keysign /mnt/suid_helper; do if [ -r \"$p\" ] && [ -u \"$p\" ]; then printf '%s;' \"$p\"; fi; done | head -c 500 || true",
         "ptrace_scope": "cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo unknown",
         "ssh_keysign": "for p in /usr/lib/openssh/ssh-keysign /usr/libexec/openssh/ssh-keysign /usr/lib/ssh/ssh-keysign; do if [ -e \"$p\" ]; then stat -c '%n:%U:%G:%a:%A' \"$p\"; fi; done | tr '\\n' ';' | head -c 500 || echo not_found",
         "chage": "if command -v chage >/dev/null 2>&1; then p=$(command -v chage); stat -c '%n:%U:%G:%a:%A' \"$p\"; else echo not_found; fi",
@@ -329,7 +363,41 @@ def helper_surface_detected(value: str) -> bool:
 
 def kernel_config_enabled(value: str) -> bool:
     normalized = (value or "").strip().lower()
-    return normalized in {"config_rxgk=y", "config_rxgk=m"}
+    return normalized.endswith("=y") or normalized.endswith("=m")
+
+
+def io_uring_enabled(config_value: str, disabled_value: str) -> bool:
+    normalized = (disabled_value or "").strip().lower()
+    if normalized in {"1", "2", "3", "y", "yes", "true"}:
+        return False
+    if normalized == "0":
+        return True
+    return kernel_config_enabled(config_value)
+
+
+def pin_theft_kernel_patched(kernel: str) -> bool:
+    parts = parse_version_tuple(kernel)
+    if len(parts) < 2:
+        return False
+
+    major, minor = parts[0], parts[1]
+    patch = parts[2] if len(parts) > 2 else 0
+    if major > 7 or (major == 7 and minor >= 1):
+        return True
+    if major == 7 and minor == 0 and patch >= 7:
+        return True
+    if major == 6 and minor == 12 and patch >= 88:
+        return True
+    if major == 6 and minor == 18 and patch >= 30:
+        return True
+    if major == 6 and minor == 6 and patch >= 140:
+        return True
+    return False
+
+
+def pin_theft_kernel_in_window(kernel: str) -> bool:
+    # PinTheft depends on the RDS zerocopy path, which is present in modern kernels.
+    return version_in_range(kernel, "4.19", "7.0.99") and not pin_theft_kernel_patched(kernel)
 
 
 def dirtydecrypt_distro_not_affected_or_patched(kernel_package: str, os_release: str, os_codename: str) -> bool:
@@ -429,10 +497,19 @@ def assess(collected: Dict[str, str]) -> List[Finding]:
     rxrpc = collected.get("mod_rxrpc") == "1"
     rxrpc_available = collected.get("rxrpc_available") == "1"
     config_rxgk = collected.get("config_rxgk", "unknown")
+    rds = collected.get("mod_rds") == "1"
+    rds_tcp = collected.get("mod_rds_tcp") == "1"
+    rds_available = collected.get("rds_available") == "1"
+    rds_tcp_available = collected.get("rds_tcp_available") == "1"
+    config_rds = collected.get("config_rds", "unknown")
+    config_rds_tcp = collected.get("config_rds_tcp", "unknown")
+    config_io_uring = collected.get("config_io_uring", "unknown")
     esp4 = collected.get("mod_esp4") == "1"
     esp6 = collected.get("mod_esp6") == "1"
     mitigation = collected.get("module_mitigation", "")
     rxgk_ioc = collected.get("rxgk_ioc", "")
+    io_uring_disabled = collected.get("io_uring_disabled", "unknown")
+    readable_suid_targets = collected.get("readable_suid_targets", "")
     ptrace_scope = collected.get("ptrace_scope", "unknown")
     ssh_keysign = collected.get("ssh_keysign", "not_found")
     chage = collected.get("chage", "not_found")
@@ -480,6 +557,32 @@ def assess(collected: Dict[str, str]) -> List[Finding]:
         findings.append(Finding("DirtyDecrypt / DirtyCBC (CVE-2026-31635)", "POSSIBLY_PATCHED", "medium", f"{dirtydecrypt_reason} rxrpc mitigation appears present or RxGK is disabled; verify kernel patch level."))
     else:
         findings.append(Finding("DirtyDecrypt / DirtyCBC (CVE-2026-31635)", "NO_DIRECT_INDICATOR", "low", f"{dirtydecrypt_reason} Kernel outside known affected CVE-2026-31635 ranges."))
+
+    rds_blocked = module_blocked("rds", mitigation)
+    rds_tcp_blocked = module_blocked("rds_tcp", mitigation)
+    rds_surface = (kernel_config_enabled(config_rds) or rds or rds_available) and not rds_blocked
+    rds_tcp_surface = (kernel_config_enabled(config_rds_tcp) or rds_tcp or rds_tcp_available) and not rds_tcp_blocked
+    io_uring_surface = io_uring_enabled(config_io_uring, io_uring_disabled)
+    suid_surface = bool(readable_suid_targets.strip())
+    pin_theft_reason = (
+        f"Kernel {kernel}, kernel_pkg={kernel_pkg}, os={os_release}, "
+        f"CONFIG_RDS={config_rds}, CONFIG_RDS_TCP={config_rds_tcp}, "
+        f"CONFIG_IO_URING={config_io_uring}, rds_loaded={rds}, rds_tcp_loaded={rds_tcp}, "
+        f"rds_available={rds_available}, rds_tcp_available={rds_tcp_available}, "
+        f"io_uring_disabled={io_uring_disabled}, rds_blocked={rds_blocked}, "
+        f"rds_tcp_blocked={rds_tcp_blocked}, readable_suid_targets={readable_suid_targets or 'none'}."
+    )
+    if pin_theft_kernel_patched(kernel):
+        findings.append(Finding("PinTheft (RDS zcopy double-free)", "POSSIBLY_PATCHED", "medium", f"{pin_theft_reason} Kernel version is at or above a known fixed upstream/stable baseline."))
+    elif pin_theft_kernel_in_window(kernel) and rds_surface and rds_tcp_surface and io_uring_surface:
+        confidence = "high" if suid_surface else "medium"
+        findings.append(Finding("PinTheft (RDS zcopy double-free)", TODO_STATUS, confidence, f"{pin_theft_reason} RDS/RDS_TCP and io_uring prerequisites are present without detected module/sysctl mitigation."))
+    elif pin_theft_kernel_in_window(kernel) and (rds_surface or rds_tcp_surface) and io_uring_surface:
+        findings.append(Finding("PinTheft (RDS zcopy double-free)", TODO_STATUS, "medium", f"{pin_theft_reason} Partial RDS surface plus enabled io_uring detected; verify kernel fix and RDS module policy."))
+    elif pin_theft_kernel_in_window(kernel):
+        findings.append(Finding("PinTheft (RDS zcopy double-free)", "POSSIBLY_PATCHED", "medium", f"{pin_theft_reason} Known exploit prerequisites appear disabled or blocked; keep kernel patch tracking in place."))
+    else:
+        findings.append(Finding("PinTheft (RDS zcopy double-free)", "NO_DIRECT_INDICATOR", "low", f"{pin_theft_reason} Kernel outside coarse affected window or above known fixed baseline."))
 
     helper_surface = helper_surface_detected(ssh_keysign) or helper_surface_detected(chage)
     ptrace_mitigated = ptrace_scope_mitigated(ptrace_scope)
@@ -565,7 +668,7 @@ def write_host_result(report_file, result: HostResult) -> bool:
     return True
 
 
-def scan_host(host: str, user: str, password: str, config: ScanConfig) -> HostResult:
+def scan_host(host: str, user: str, password: Optional[str], config: ScanConfig) -> HostResult:
     reachable = ping_host(host, config.probe_timeout) or tcp_open(host, 22, config.probe_timeout)
     result = HostResult(host=host, reachable=reachable)
     if not reachable:
@@ -588,7 +691,7 @@ def scan_host(host: str, user: str, password: str, config: ScanConfig) -> HostRe
 def scan_host_tracked(
     host: str,
     user: str,
-    password: str,
+    password: Optional[str],
     config: ScanConfig,
     active_hosts: Dict[str, float],
     active_lock: threading.Lock,
@@ -724,7 +827,7 @@ def submit_next(
     hosts_iter: Iterator[str],
     pending: Dict[Future, str],
     user: str,
-    password: str,
+    password: Optional[str],
     config: ScanConfig,
     active_hosts: Dict[str, float],
     active_lock: threading.Lock,
@@ -738,7 +841,7 @@ def submit_next(
     return True
 
 
-def scan_hosts(hosts: List[str], user: str, password: str, mode: str, target: str, report_path: Path, config: ScanConfig) -> ScanOutcome:
+def scan_hosts(hosts: List[str], user: str, password: Optional[str], mode: str, target: str, report_path: Path, config: ScanConfig) -> ScanOutcome:
     # Run host checks in parallel while streaming actionable findings into the report file.
     results_by_host: Dict[str, HostResult] = {}
     active_hosts: Dict[str, float] = {}
@@ -749,6 +852,7 @@ def scan_hosts(hosts: List[str], user: str, password: str, mode: str, target: st
         [
             f"{C.CYAN}Target:{C.RESET} {target} ({len(hosts)} host(s))",
             f"{C.CYAN}Workers:{C.RESET} {config.workers}",
+            f"{C.CYAN}SSH Auth:{C.RESET} {'private key' if config.key_file else 'password'}",
             f"{C.CYAN}Report:{C.RESET} {report_path}",
         ],
     )
@@ -860,6 +964,19 @@ def prompt_required(prompt: str, secret: bool = False, redraw_banner: bool = Fal
         print(f"{C.YELLOW}[!] This field is required.{C.RESET}")
 
 
+def prompt_optional(prompt: str, secret: bool = False, redraw_banner: bool = False) -> Optional[str]:
+    if redraw_banner:
+        clear_screen()
+        print_banner()
+    try:
+        raw_value = getpass(prompt) if secret else input(prompt)
+    except EOFError:
+        return None
+    if not raw_value.strip():
+        return None
+    return raw_value if secret else raw_value.strip()
+
+
 def resolve_target(args: argparse.Namespace) -> str:
     target = args.subnet_option or args.subnet
     if args.subnet_option and args.subnet and args.subnet_option != args.subnet:
@@ -869,7 +986,47 @@ def resolve_target(args: argparse.Namespace) -> str:
     return prompt_required("Target to scan (CIDR or range, e.g. 10.0.10.0/24 or 10.215.0.0-10.215.5.254): ", redraw_banner=True)
 
 
-def resolve_password(args: argparse.Namespace) -> str:
+def resolve_key_file(args: argparse.Namespace) -> Optional[Path]:
+    if not args.key_file:
+        return None
+
+    key_file = Path(args.key_file).expanduser()
+    if not key_file.is_file():
+        raise SystemExit(f"SSH private key file not found: {key_file}")
+    return key_file
+
+
+def resolve_key_passphrase(args: argparse.Namespace, key_file: Optional[Path]) -> Optional[str]:
+    if not key_file:
+        if args.key_passphrase is not None:
+            raise SystemExit("--key-passphrase requires --key-file")
+        if args.key_passphrase_env is not None:
+            raise SystemExit("--key-passphrase-env requires --key-file")
+        if args.ask_key_passphrase:
+            raise SystemExit("--ask-key-passphrase requires --key-file")
+        return None
+
+    if args.key_passphrase is not None:
+        if not args.key_passphrase:
+            raise SystemExit("--key-passphrase cannot be empty")
+        return args.key_passphrase
+
+    env_name = args.key_passphrase_env or DEFAULT_KEY_PASSPHRASE_ENV
+    env_value = os.environ.get(env_name)
+    if env_value:
+        return env_value
+
+    if args.ask_key_passphrase:
+        return prompt_optional(f"SSH key passphrase [{env_name} not set, empty for none]: ", secret=True, redraw_banner=True)
+    return None
+
+
+def resolve_password(args: argparse.Namespace, key_file: Optional[Path]) -> Optional[str]:
+    if key_file:
+        if args.password is not None:
+            raise SystemExit("--password cannot be used together with --key-file")
+        return None
+
     if args.password is not None:
         if not args.password:
             raise SystemExit("--password cannot be empty")
@@ -885,7 +1042,7 @@ def resolve_password(args: argparse.Namespace) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Authenticated Linux LPE exposure scanner for Dirty Frag, Fragnesia, DirtyDecrypt, SSH Keysign Pwn, Copy Fail, and Pack2TheRoot.",
+        description="Authenticated Linux LPE exposure scanner for Dirty Frag, Fragnesia, DirtyDecrypt, PinTheft, SSH Keysign Pwn, Copy Fail, and Pack2TheRoot.",
     )
     parser.add_argument("subnet", nargs="?", help="CIDR or inclusive IP range to scan, e.g. 10.0.10.0/24 or 10.215.0.0-10.215.5.254")
     parser.add_argument("--subnet", dest="subnet_option", help="CIDR or inclusive IP range to scan; alternative to the positional target")
@@ -893,6 +1050,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-u", "--username", help="SSH username. If omitted, you will be prompted.")
     parser.add_argument("--password", help="SSH password. Prefer the prompt or --password-env for shell history safety.")
     parser.add_argument("--password-env", help=f"Environment variable containing the SSH password. Defaults to {DEFAULT_PASSWORD_ENV}.")
+    parser.add_argument("--key-file", help="SSH private key file for key-based authentication. When set, password authentication is not used.")
+    parser.add_argument("--key-passphrase", help="Passphrase for an encrypted SSH private key. Prefer --key-passphrase-env or --ask-key-passphrase for shell history safety.")
+    parser.add_argument("--key-passphrase-env", help=f"Environment variable containing the SSH private key passphrase. Defaults to {DEFAULT_KEY_PASSPHRASE_ENV}.")
+    parser.add_argument("--ask-key-passphrase", action="store_true", help="Prompt for the SSH private key passphrase. Leave empty for an unencrypted key.")
     parser.add_argument("--workers", type=worker_count, default=MIN_WORKER_THREADS, help=f"Parallel worker threads. Minimum/default: {MIN_WORKER_THREADS}.")
     parser.add_argument("--output-dir", type=Path, default=Path("."), help="Directory for report output. Default: current directory.")
     parser.add_argument("--report-prefix", default=DEFAULT_REPORT_PREFIX, help=f"Report filename prefix. Default: {DEFAULT_REPORT_PREFIX}.")
@@ -925,7 +1086,9 @@ def main() -> int:
     user = args.username.strip() if args.username else prompt_required("SSH username: ", redraw_banner=True)
     if not user:
         raise SystemExit("SSH username cannot be empty")
-    password = resolve_password(args)
+    key_file = resolve_key_file(args)
+    key_passphrase = resolve_key_passphrase(args, key_file)
+    password = resolve_password(args, key_file)
 
     config = ScanConfig(
         workers=args.workers,
@@ -934,12 +1097,15 @@ def main() -> int:
         command_timeout=args.command_timeout,
         strict_host_key=args.strict_host_key,
         live=not args.no_live and sys.stdout.isatty(),
+        key_file=key_file,
+        key_passphrase=key_passphrase,
     )
 
     report_path = report_path_for_target(args.output_dir, args.report_prefix, target_spec.label)
     if not config.live:
         print(f"{C.CYAN}Target:{C.RESET} {target_spec.label} ({len(hosts)} host(s))")
         print(f"{C.CYAN}Workers:{C.RESET} {config.workers}")
+        print(f"{C.CYAN}SSH Auth:{C.RESET} {'private key' if config.key_file else 'password'}")
         print(f"{C.CYAN}Report:{C.RESET} {report_path}\n")
 
     outcome = scan_hosts(hosts, user, password, "authenticated", target_spec.label, report_path, config)
