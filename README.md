@@ -5,6 +5,7 @@ Linux LPE Exposure Scan is a fast, authenticated SSH scanner for identifying Lin
 * Dirty Frag (CVE-2026-43284 / CVE-2026-43500)
 * Fragnesia (CVE-2026-46300)
 * DirtyDecrypt / DirtyCBC (CVE-2026-31635)
+* PinTheft (RDS zcopy double-free)
 * SSH Keysign Pwn (CVE-2026-46333)
 * Copy Fail (CVE-2026-31431)
 * Pack2TheRoot (CVE-2026-41651)
@@ -18,6 +19,7 @@ The tool runs with at least 32 parallel worker threads, shows a colored live pro
   * Authenticated SSH collection for local host facts
   * Fragnesia exposure check using kernel, distro, ESP/RXRPC module, and modprobe mitigation indicators
   * DirtyDecrypt / DirtyCBC exposure check using kernel, distro, `CONFIG_RXGK`, RxRPC module, mitigation, and kernel-log indicators
+  * PinTheft exposure check using kernel, RDS/RDS_TCP config and module state, `io_uring` state, module mitigations, and readable SUID-root target indicators
   * SSH Keysign Pwn exposure check using kernel package, distro, `ptrace_scope`, `ssh-keysign`, and `chage` indicators
   * Parallel scanning with a minimum of 32 worker threads
   * Accepts CIDR targets and inclusive IP ranges
@@ -114,6 +116,7 @@ The final terminal summary also shows only probably vulnerable hosts.
   * Authenticated SSH access is required because local LPE exposure cannot be assessed reliably without host facts.
   * Fragnesia checks are defensive exposure indicators only. They look at the running kernel, distribution hints, ESP/RXRPC module state, and modprobe mitigations.
   * DirtyDecrypt / DirtyCBC checks are defensive exposure indicators only. They look at the running kernel, distro fix hints, `CONFIG_RXGK`, RxRPC module availability, RxRPC mitigation, and available kernel-log indicators.
+  * PinTheft checks are defensive exposure indicators only. They look at the running kernel, RDS/RDS_TCP availability, `CONFIG_IO_URING`, `kernel.io_uring_disabled`, RDS module mitigations, and common readable SUID-root target paths.
   * SSH Keysign Pwn checks are defensive exposure indicators only. They look at the running kernel, distro fix baselines, public helper surfaces, and the `kernel.yama.ptrace_scope` mitigation.
   * Kernel and package version checks are coarse indicators. Distribution backports may change the real patch status.
   * Default SSH host key behavior accepts unknown host keys for scan practicality. Use `--strict-host-key` in environments where known-hosts enforcement is required.
@@ -130,4 +133,4 @@ This tool is intended for authorized security testing and defensive exposure ass
 
 ## About
 
-Linux LPE Exposure Scan is a multithreaded authenticated scanner for quickly identifying Linux hosts that probably need follow-up for selected local privilege escalation exposures, including Dirty Frag, Fragnesia, DirtyDecrypt / DirtyCBC, SSH Keysign Pwn, Copy Fail, and Pack2TheRoot.
+Linux LPE Exposure Scan is a multithreaded authenticated scanner for quickly identifying Linux hosts that probably need follow-up for selected local privilege escalation exposures, including Dirty Frag, Fragnesia, DirtyDecrypt / DirtyCBC, PinTheft, SSH Keysign Pwn, Copy Fail, and Pack2TheRoot.
